@@ -10,6 +10,7 @@
 
 import copy
 import os
+import random
 from time import perf_counter
 
 import click
@@ -136,7 +137,7 @@ def project(
 @click.option('--network', 'network_pkl', help='Network pickle filename', required=True)
 @click.option('--target', 'target_fname', help='Target image file to project to', required=True, metavar='FILE')
 @click.option('--num-steps',              help='Number of optimization steps', type=int, default=1000, show_default=True)
-@click.option('--seed',                   help='Random seed', type=int, default=303, show_default=True)
+@click.option('--seed',                   help='Random seed', type=int, default=-1, show_default=True)
 @click.option('--save-video',             help='Save an mp4 video of optimization progress', type=bool, default=True, show_default=True)
 @click.option('--outdir',                 help='Where to save the output images', required=True, metavar='DIR')
 def run_projection(
@@ -155,6 +156,8 @@ def run_projection(
     python projector.py --outdir=out --target=~/mytargetimg.png \\
         --network=https://nvlabs-fi-cdn.nvidia.com/stylegan2-ada-pytorch/pretrained/ffhq.pkl
     """
+    if seed == -1:
+        seed = random.randint(0, 500000)
     np.random.seed(seed)
     torch.manual_seed(seed)
 
