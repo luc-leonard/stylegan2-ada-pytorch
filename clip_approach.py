@@ -49,6 +49,7 @@ def best_guess_for_seed(G, model, text_features):
 def approach(
         G,
         *,
+        one_cycle=False,
         num_steps=100,
         initial_learning_rate=0.02,
         initial_noise_factor=0.02,
@@ -118,6 +119,7 @@ def approach(
     # Setup noise inputs.
     noise_bufs = {name: buf for (name, buf) in G.synthesis.named_buffers() if 'noise_const' in name}
     w_opt = torch.tensor(w_avg, dtype=torch.float32, device=device, requires_grad=True)  # pylint: disable=not-callable
+
     w_out = torch.zeros([num_steps] + list(w_opt.shape[1:]), dtype=torch.float32, device=device)
 
     if noise_opt:
@@ -126,6 +128,10 @@ def approach(
     else:
         optimizer = torch.optim.Adam([w_opt], betas=(0.9, 0.999), lr=initial_learning_rate)
         print('optimizer: w')
+
+    scheduler = None
+    if one_cycle:
+       scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=initial_learning_rate * 10, total_steps=num_steps)
 
     # Init noise.
     for buf in noise_bufs.values():
@@ -146,18 +152,13 @@ def approach(
         w_noise = torch.randn_like(w_opt) * w_noise_scale
         ws = (w_opt + w_noise).repeat([1, G.mapping.num_ws, 1])
         synth_images = G.synthesis(ws, noise_mode='const')
-
-
-
-        into = synth_images
-        into = nom(into)  # normalize copied from CLIP preprocess. doesn't seem to affect tho
+        synth_images = nom(synth_images)  # normalize copied from CLIP preprocess. doesn't seem to affect tho
 
         # scale to CLIP input size
         into = torch.nn.functional.interpolate(synth_images, (224, 224), mode='bilinear', align_corners=True)
-        #into = avg_pool(into)
         # CLIP expects [1, 3, 224, 224], so we should be fine
         image_features = perceptor.encode_image(into)
-        proximity = -30 * torch.cosine_similarity(text_features, image_features, dim=-1).mean()  # Dunno why 30 works lol
+        loss = -30 * torch.cosine_similarity(text_features, image_features, dim=-1).mean()  # Dunno why 30 works lol
 
         # noise reg, from og projector
         reg_loss = 0.0
@@ -171,18 +172,19 @@ def approach(
                 noise = F.avg_pool2d(noise, kernel_size=2)
 
         if noise_opt:
-            loss = proximity + reg_loss * regularize_noise_weight
+            loss = loss + reg_loss * regularize_noise_weight
         else:
-            loss = proximity
+            loss = loss
 
         # Step
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
-        #scheduler.step()
+        if one_cycle:
+            scheduler.step()
 
         print(f'step {step + 1:>4d}/{num_steps}:  loss {float(loss):<5.2f} ', 'lr',
-              lr, f'noise scale: {float(w_noise_scale):<5.6f}', f'proximity: {float(proximity / (-30)):<5.6f}')
+              lr, f'noise scale: {float(w_noise_scale):<5.6f}', f'proximity: {float(loss / (-30)):<5.6f}')
 
         w_out[step] = w_opt.detach()[0]
 
@@ -198,20 +200,40 @@ def approach(
 @click.command()
 @click.pass_context
 @click.option('--network', 'network_pkl', help='Network pickle filename', required=True)
+@click.option('--lr', 'lr', help='Learning rate', default=0.02)
 @click.option('--seed', type=int, help='The seed')
 @click.option('--outdir', help='Where to save the output images', type=str, required=True, metavar='DIR')
 @click.option('--text', help='text', type=str, required=True)
+@click.option('--one-cycle', 'one_cycle', type=bool, required=False)
 @click.option('--num-steps', help='num step', type=int, default=100)
+@click.option('--noise-factor', 'noise_factor', help='noise factor', type=float, default=0.02)
+@click.option('--projected-w', help='Projection result file', type=str, metavar='FILE')
 def main(ctx: click.Context,
-         network_pkl: str,
+         network_pkl: str,\
          seed: Optional[int],
          outdir: str,
          text: str,
-         num_steps: int):
+         lr: float,
+         one_cycle: bool,
+         noise_factor: float,
+         num_steps: int,
+         projected_w: str):
+
     device = torch.device('cuda:0')
     with dnnlib.util.open_url(network_pkl) as f:
         G = legacy.load_network_pkl(f)['G_ema'].to(device)
-    projected_ws = approach(G, num_steps=num_steps, seed=seed, text=text, device=device, autoseed=seed is None)
+
+    projected_ws = approach(G,
+                            ws=np.load(projected_w)['w'],
+                            num_steps=num_steps,
+                            seed=seed,
+                            text=text,
+                            device=device,
+                            autoseed=seed is None,
+                            initial_learning_rate=lr,
+                            initial_noise_factor=noise_factor,
+                            one_cycle=one_cycle)
+
     Path(outdir).mkdir(exist_ok=True)
     video = imageio.get_writer(f'{outdir}/out.mp4', mode='I', fps=10, codec='libx264', bitrate='16M')
     for projected_w in projected_ws:
@@ -232,7 +254,7 @@ def main(ctx: click.Context,
     synth_image = (synth_image + 1) * (255 / 2)
     synth_image = synth_image.permute(0, 2, 3, 1).clamp(0, 255).to(torch.uint8)[0].cpu().numpy()
     PIL.Image.fromarray(synth_image, 'RGB').save(f'{outdir}/out.png')
-
+    np.savez(f'{outdir}/projected_w.npz', w=projected_w.unsqueeze(0).cpu().numpy())
 
 if __name__ == '__main__':
     main()
